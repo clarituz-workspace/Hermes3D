@@ -273,6 +273,13 @@ function mapDevinSessionState(session) {
 
 const TERMINAL_STATES = new Set(["completed", "failed", "cancelled", "unreachable"]);
 
+// Synthesized transient placeholders — safe to drop once a real reply follows.
+const TRANSIENT_PLACEHOLDER_TEXTS = new Set([
+  "Devin is waiting for your input.",
+  "Devin is waiting for an approval in the Devin app.",
+  "Devin suspended the session (idle). Send a message to resume it.",
+]);
+
 // ---------------------------------------------------------------------------
 // State store (JSON file; consistent with existing ~/.hermes persistence)
 // ---------------------------------------------------------------------------
@@ -409,6 +416,8 @@ function createDevinGateway(options = {}) {
   const activeRuns = new Map();
   /** sessionKey -> runId currently collecting output */
   const sessionRuns = new Map();
+  /** chat.send idempotencyKeys already accepted (bounded LRU-ish) */
+  const sentIdempotencyKeys = new Set();
   const sessionSettings = new Map();
   const agentFiles = new Map();
   let syncTimer = null;
@@ -575,6 +584,7 @@ function createDevinGateway(options = {}) {
     // and rely on event_id dedup (bounded to keep polling cheap).
     let newItemCount = 0;
     let historyDirty = false;
+    const lateAssistantMessages = [];
     try {
       const history = getHistory(sessionKey);
       let after = null;
@@ -609,6 +619,12 @@ function createDevinGateway(options = {}) {
               };
               historyDirty = true;
             } else {
+              // A real Devin reply supersedes a trailing synthesized
+              // placeholder ("waiting for your input", "suspended", ...).
+              const lastEntry = history[history.length - 1];
+              if (role === "assistant" && lastEntry?.synthetic) {
+                history.splice(history.length - 1, 1);
+              }
               history.push({
                 role,
                 content,
@@ -616,11 +632,13 @@ function createDevinGateway(options = {}) {
                 createdAt: item.created_at ?? null,
               });
               newItemCount += 1;
-              // Stream only newly-seen assistant content to active runs —
-              // replaying the full list each tick would duplicate transcripts.
               if (role === "assistant") {
+                // Stream only newly-seen assistant content to active runs —
+                // replaying the full list each tick would duplicate transcripts.
+                let streamed = false;
                 for (const run of activeRuns.values()) {
                   if (run.sessionKey !== sessionKey || run.done) continue;
+                  streamed = true;
                   run.transcript = run.transcript ? `${run.transcript}\n\n${content}` : content;
                   broadcastEvent({
                     type: "event",
@@ -633,6 +651,11 @@ function createDevinGateway(options = {}) {
                     },
                   });
                 }
+                // No active run consumed this message (e.g. it landed after the
+                // run closed on waiting_*/suspended). Queue a `final` so the
+                // client surfaces it immediately instead of waiting for a
+                // history refresh that may never fire while the agent is idle.
+                if (!streamed) lateAssistantMessages.push(content);
               }
             }
           }
@@ -661,6 +684,47 @@ function createDevinGateway(options = {}) {
           history.splice(i, 1);
           historyDirty = true;
         }
+      }
+      // Remove stale synthesized placeholders sitting before a real Devin
+      // reply — a trailing one stays, since it reflects the current state.
+      // Legacy entries (written before the `synthetic` flag) are matched by
+      // the known transient texts.
+      let lastRealAssistantIdx = -1;
+      for (let i = history.length - 1; i >= 0; i -= 1) {
+        if (history[i].eventId && history[i].role === "assistant") {
+          lastRealAssistantIdx = i;
+          break;
+        }
+      }
+      if (lastRealAssistantIdx > 0) {
+        for (let i = lastRealAssistantIdx - 1; i >= 0; i -= 1) {
+          const entry = history[i];
+          if (
+            entry.role === "assistant" &&
+            !entry.eventId &&
+            (entry.synthetic || TRANSIENT_PLACEHOLDER_TEXTS.has(entry.content))
+          ) {
+            history.splice(i, 1);
+            lastRealAssistantIdx -= 1;
+            historyDirty = true;
+          }
+        }
+      }
+      // Surface assistant messages that arrived after the run closed — a
+      // runless `final` is processed by the client and triggers a history
+      // refresh, so the reply shows up in the open chat panel right away.
+      for (const content of lateAssistantMessages) {
+        broadcastEvent({
+          type: "event",
+          event: "chat",
+          payload: {
+            runId: null,
+            sessionKey,
+            state: "final",
+            stopReason: "end_turn",
+            message: { role: "assistant", content },
+          },
+        });
       }
       if (newItemCount > 0 || historyDirty) store.persist();
     } catch (err) {
@@ -705,6 +769,7 @@ function createDevinGateway(options = {}) {
             history.push({
               role: "assistant",
               content: finalText,
+              synthetic: true,
               createdAt: Math.floor(Date.now() / 1000),
             });
             store.persist();
@@ -1081,6 +1146,17 @@ function createDevinGateway(options = {}) {
         if (!state.agents.has(agentId)) {
           return resErr(id, "not_found", `Agent ${agentId} not found`);
         }
+        // Honor the protocol idempotencyKey: a retried chat.send must not
+        // create a second Devin session or resend the message.
+        if (typeof p.idempotencyKey === "string" && p.idempotencyKey) {
+          if (sentIdempotencyKeys.has(p.idempotencyKey)) {
+            return resOk(id, { status: "started", runId: p.idempotencyKey, deduplicated: true });
+          }
+          if (sentIdempotencyKeys.size > 500) {
+            sentIdempotencyKeys.delete(sentIdempotencyKeys.keys().next().value);
+          }
+          sentIdempotencyKeys.add(p.idempotencyKey);
+        }
         try {
           requireConfigured();
         } catch (err) {
@@ -1135,6 +1211,7 @@ function createDevinGateway(options = {}) {
           getHistory(key).push({
             role: "assistant",
             content: "Run aborted.",
+            synthetic: true,
             createdAt: Math.floor(Date.now() / 1000),
           });
           const meta = state.sessionMeta.get(key) || {};
