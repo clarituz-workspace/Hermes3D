@@ -2449,18 +2449,27 @@ export function OfficeScreen({
   // moment later this effect used to skip hydration and the office stayed
   // stuck on the lone "Main" placeholder. When connected and the fleet is
   // still exactly that placeholder, force one reload per connection.
+  // Extended: the same stale-fleet trap happens when switching gateways (e.g.
+  // Hermes -> Devin) — a leftover roster from a previous backend keeps
+  // agentsLoaded=true and hydration never runs. Reload once per connected
+  // epoch whenever there is a fleet or placeholder in the store; hydrateAgents
+  // preserves per-agent state by id, so a redundant reload is harmless.
   const demoPlaceholderReloadRef = useRef(false);
   useEffect(() => {
     if (status !== "connected") {
       demoPlaceholderReloadRef.current = false;
       return;
     }
+    if (demoPlaceholderReloadRef.current) return;
     const onlyDemoPlaceholder =
       state.agents.length === 1 && state.agents[0]?.agentId === MAIN_AGENT_ID;
-    const shouldRecoverFromPlaceholder =
-      onlyDemoPlaceholder && !demoPlaceholderReloadRef.current;
-    if (agentsLoaded && !shouldRecoverFromPlaceholder) return;
-    if (shouldRecoverFromPlaceholder) demoPlaceholderReloadRef.current = true;
+    if (
+      agentsLoaded &&
+      !onlyDemoPlaceholder &&
+      state.agents.length === 0
+    )
+      return;
+    demoPlaceholderReloadRef.current = true;
     void loadAgents({ forceSettings: true });
   }, [agentsLoaded, loadAgents, state.agents, status]);
 
