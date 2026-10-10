@@ -406,6 +406,71 @@ describe("devin-gateway-adapter protocol", () => {
     expect(client.listSessionMessages).toHaveBeenCalled();
   });
 
+  it("merges the API echo of the user message instead of duplicating it", async () => {
+    const { gateway } = makeGateway({
+      listSessionMessages: vi.fn(async () => ({
+        items: [
+          { event_id: "event-u1", source: "user", message: "hello devin", created_at: 10 },
+          { event_id: "event-d1", source: "devin", message: "Hi! How can I help?", created_at: 11 },
+        ],
+        has_next_page: false,
+        end_cursor: null,
+      })),
+    });
+    await callGateway(gateway,
+      "devin.agent.bind",
+      { agentId: "devin-backend", devinSessionId: "devin-echo" },
+      "b",
+      () => {}
+    );
+    // chat.send pushes the user message locally (no eventId yet).
+    await callGateway(gateway,
+      "chat.send",
+      { sessionKey: "agent:devin-backend:main", message: "hello devin" },
+      "r1",
+      () => {}
+    );
+    await gateway.syncAllSessions();
+    const history = gateway._state.history.get("agent:devin-backend:main");
+    const userCopies = history.filter(
+      (m: { role: string; content: string }) => m.role === "user" && m.content === "hello devin"
+    );
+    expect(userCopies).toHaveLength(1);
+    expect(userCopies[0].eventId).toBe("event-u1");
+    expect(history.some((m: { eventId?: string }) => m.eventId === "event-d1")).toBe(true);
+  });
+
+  it("closes an active run when the Devin session is suspended", async () => {
+    const { gateway, client } = makeGateway({
+      getSession: vi.fn(async () => fakeSession({ status: "suspended", status_detail: "inactivity" })),
+      listSessionMessages: vi.fn(async () => ({ items: [], has_next_page: false })),
+    });
+    await callGateway(gateway,
+      "devin.agent.bind",
+      { agentId: "devin-backend", devinSessionId: "devin-susp" },
+      "b",
+      () => {}
+    );
+    const { events, unsubscribe } = collectEvents(gateway);
+    await callGateway(gateway,
+      "chat.send",
+      { sessionKey: "agent:devin-backend:main", message: "work please" },
+      "r1",
+      () => {}
+    );
+    await gateway.syncAllSessions();
+    unsubscribe();
+    const finals = events.filter(
+      (f) =>
+        f.event === "chat" &&
+        (f.payload as { state?: string } | undefined)?.state === "final"
+    );
+    expect(finals.length).toBeGreaterThan(0);
+    const history = gateway._state.history.get("agent:devin-backend:main");
+    expect(history[history.length - 1].role).toBe("assistant");
+    expect(client.getSession).toHaveBeenCalled();
+  });
+
   it("marks a session unreachable when the API returns 404", async () => {
     const getSession = vi
       .fn()

@@ -570,55 +570,101 @@ function createDevinGateway(options = {}) {
     };
     state.sessionMeta.set(sessionKey, nextMeta);
 
-    // Pull new messages since the stored cursor.
-    const cursor = state.cursors.get(sessionKey) || null;
+    // Pull new messages. The `after` param expects the opaque end_cursor from a
+    // previous page — NOT an event_id — so we always walk pages from the start
+    // and rely on event_id dedup (bounded to keep polling cheap).
     let newItemCount = 0;
+    let historyDirty = false;
     try {
-      const page = await client.listSessionMessages(binding.devinSessionId, {
-        first: 100,
-        ...(cursor ? { after: cursor } : {}),
-      });
-      const items = Array.isArray(page?.items) ? page.items : [];
       const history = getHistory(sessionKey);
-      for (const item of items) {
-        const role = item.source === "devin" ? "assistant" : "user";
-        const content = typeof item.message === "string" ? item.message : "";
-        if (!content) continue;
-        const alreadySeen =
-          item.event_id != null &&
-          history.some((entry) => entry.eventId === item.event_id);
-        if (!alreadySeen) {
-          history.push({
-            role,
-            content,
-            eventId: item.event_id,
-            createdAt: item.created_at ?? null,
-          });
-          newItemCount += 1;
-        }
-        // Stream to any active run on this session that started before this event.
-        for (const run of activeRuns.values()) {
-          if (run.sessionKey !== sessionKey || run.done) continue;
-          if (role === "assistant") {
-            run.transcript = run.transcript ? `${run.transcript}\n\n${content}` : content;
-            broadcastEvent({
-              type: "event",
-              event: "chat",
-              payload: {
-                runId: run.runId,
-                sessionKey,
-                state: "delta",
-                message: { role: "assistant", content: run.transcript },
-              },
-            });
+      let after = null;
+      let truncated = false;
+      for (let pageNum = 0; pageNum < 10; pageNum += 1) {
+        const page = await client.listSessionMessages(binding.devinSessionId, {
+          first: 200,
+          ...(after ? { after } : {}),
+        });
+        const items = Array.isArray(page?.items) ? page.items : [];
+        for (const item of items) {
+          const role = item.source === "devin" ? "assistant" : "user";
+          const content = typeof item.message === "string" ? item.message : "";
+          if (!content) continue;
+          const alreadySeen =
+            item.event_id != null &&
+            history.some((entry) => entry.eventId === item.event_id);
+          if (!alreadySeen) {
+            // The API echoes the user's own message back; merge it into the
+            // locally-pushed entry (which has no eventId) instead of duplicating.
+            const echoIndex =
+              item.event_id != null
+                ? history.findIndex(
+                    (entry) => !entry.eventId && entry.role === role && entry.content === content
+                  )
+                : -1;
+            if (echoIndex >= 0) {
+              history[echoIndex] = {
+                ...history[echoIndex],
+                eventId: item.event_id,
+                createdAt: item.created_at ?? history[echoIndex].createdAt,
+              };
+              historyDirty = true;
+            } else {
+              history.push({
+                role,
+                content,
+                eventId: item.event_id,
+                createdAt: item.created_at ?? null,
+              });
+              newItemCount += 1;
+              // Stream only newly-seen assistant content to active runs —
+              // replaying the full list each tick would duplicate transcripts.
+              if (role === "assistant") {
+                for (const run of activeRuns.values()) {
+                  if (run.sessionKey !== sessionKey || run.done) continue;
+                  run.transcript = run.transcript ? `${run.transcript}\n\n${content}` : content;
+                  broadcastEvent({
+                    type: "event",
+                    event: "chat",
+                    payload: {
+                      runId: run.runId,
+                      sessionKey,
+                      state: "delta",
+                      message: { role: "assistant", content: run.transcript },
+                    },
+                  });
+                }
+              }
+            }
           }
         }
-        if (item.event_id) state.cursors.set(sessionKey, item.event_id);
+        if (page?.has_next_page && page?.end_cursor) {
+          after = page.end_cursor;
+        } else {
+          truncated = false;
+          break;
+        }
+        truncated = true;
       }
-      if (page?.end_cursor) state.cursors.set(sessionKey, page.end_cursor);
-      if (newItemCount > 0) store.persist();
-    } catch {
-      /* message fetch failures are non-fatal; retried next tick */
+      if (truncated) {
+        console.warn(
+          `[devin-gateway] message history for ${sessionKey} exceeds page limit; oldest sync window reached`
+        );
+      }
+      // Drop leftover local echoes that a remote item (same role+content,
+      // carrying an eventId) already covers — fixes pre-dedup duplicates too.
+      const covered = new Set(
+        history.filter((e) => e.eventId).map((e) => `${e.role}::${e.content}`)
+      );
+      for (let i = history.length - 1; i >= 0; i -= 1) {
+        const entry = history[i];
+        if (!entry.eventId && covered.has(`${entry.role}::${entry.content}`)) {
+          history.splice(i, 1);
+          historyDirty = true;
+        }
+      }
+      if (newItemCount > 0 || historyDirty) store.persist();
+    } catch (err) {
+      console.warn(`[devin-gateway] message sync failed for ${sessionKey}:`, sanitize(err));
     }
 
     const stateChanged = prevState !== nextState;
@@ -628,8 +674,13 @@ function createDevinGateway(options = {}) {
       emitDevinSessionEvent(sessionKey);
     }
 
-    // Close out runs when the Devin turn ends.
-    if (TERMINAL_STATES.has(nextState) || nextState === "waiting_input" || nextState === "waiting_approval") {
+    // Close out runs when the Devin turn ends (or the session idles out).
+    if (
+      TERMINAL_STATES.has(nextState) ||
+      nextState === "waiting_input" ||
+      nextState === "waiting_approval" ||
+      nextState === "suspended"
+    ) {
       for (const run of [...activeRuns.values()]) {
         if (run.sessionKey !== sessionKey || run.done) continue;
         run.done = true;
@@ -641,7 +692,24 @@ function createDevinGateway(options = {}) {
             ? "Devin is waiting for your input."
             : nextState === "waiting_approval"
               ? "Devin is waiting for an approval in the Devin app."
-              : `Session ${nextState}.`);
+              : nextState === "suspended"
+                ? "Devin suspended the session (idle). Send a message to resume it."
+                : `Session ${nextState}.`);
+        // Persist synthesized terminal text so chat.history ends with an
+        // assistant entry — the client treats a user-tail history as an
+        // orphaned run and would keep the agent in "running" forever.
+        if (!run.transcript) {
+          const history = getHistory(sessionKey);
+          const lastEntry = history[history.length - 1];
+          if (!(lastEntry && lastEntry.role === "assistant" && lastEntry.content === finalText)) {
+            history.push({
+              role: "assistant",
+              content: finalText,
+              createdAt: Math.floor(Date.now() / 1000),
+            });
+            store.persist();
+          }
+        }
         if (nextState === "failed" || nextState === "unreachable") {
           broadcastEvent({
             type: "event",
@@ -754,7 +822,9 @@ function createDevinGateway(options = {}) {
         const meta = state.sessionMeta.get(sessionKey) || {};
         state.sessionMeta.set(sessionKey, {
           ...meta,
-          state: meta.state === "suspended" ? "starting" : meta.state || "running",
+          // A fresh user message means Devin is resuming work — don't keep a
+          // waiting_* state or the next sync tick would close the run early.
+          state: TERMINAL_STATES.has(meta.state) ? meta.state : "starting",
           status: meta.status === "suspended" ? "resuming" : meta.status,
           lastError: null,
         });
@@ -1060,6 +1130,13 @@ function createDevinGateway(options = {}) {
               console.warn("[devin-gateway] terminate failed:", sanitize(err));
             }
           }
+          // Terminal marker so chat.history no longer ends on the user
+          // message — otherwise the client re-marks the agent as running.
+          getHistory(key).push({
+            role: "assistant",
+            content: "Run aborted.",
+            createdAt: Math.floor(Date.now() / 1000),
+          });
           const meta = state.sessionMeta.get(key) || {};
           state.sessionMeta.set(key, { ...meta, state: "cancelled", lastSyncAt: Date.now() });
           aborted += 1;

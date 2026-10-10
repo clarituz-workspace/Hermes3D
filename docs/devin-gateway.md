@@ -121,8 +121,12 @@ DEVIN_API_KEY=cog_... DEVIN_ORG_ID=org-... \
   "Needs input"/"Needs approval" quando o Devin está `waiting_for_user` ou
   `waiting_for_approval`.
 - **Sincronização**: o gateway faz polling a cada `DEVIN_SYNC_INTERVAL_MS`,
-  deduplica mensagens por `event_id` (cursor `after`) e reidrata o estado ao
-  reiniciar a partir do `state.json`.
+  deduplica mensagens por `event_id` e reidrata o estado ao
+  reiniciar a partir do `state.json`. O endpoint de mensagens do Devin aceita
+  `after` apenas como `end_cursor` opaco de página — por isso o sync percorre
+  as páginas desde o início (limite de 10 × 200 mensagens) e confia na
+  deduplicação por `event_id`, em vez de persistir cursores. A mensagem do
+  usuário ecoada pela API é mesclada à entrada local, sem duplicar.
 
 ## Mapeamento de estados
 
