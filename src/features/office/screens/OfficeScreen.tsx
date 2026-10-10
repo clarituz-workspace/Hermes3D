@@ -150,6 +150,7 @@ import type {
   CompanyBuilderPlan,
 } from "@/features/company-builder/types";
 import { AnalyticsPanel } from "@/features/office/components/panels/AnalyticsPanel";
+import { DevinPanel } from "@/features/office/components/panels/DevinPanel";
 import { HistoryPanel } from "@/features/office/components/panels/HistoryPanel";
 import { InboxPanel } from "@/features/office/components/panels/InboxPanel";
 import { KanbanDisabledPanel } from "@/features/office/components/panels/KanbanDisabledPanel";
@@ -4932,6 +4933,18 @@ export function OfficeScreen({
               cronEnabled={runtimeSupportsCron}
               agents={state.agents}
               standup={standupController}
+            />
+          }
+          devinPanel={
+            <DevinPanel
+              client={client}
+              status={status}
+              providerId={provider.id}
+              agents={state.agents}
+              onSelectAgent={(agentId) => {
+                handleOpenAgentChat(agentId);
+                setActiveSidebarTab("devin");
+              }}
             />
           }
           analyticsPanel={
